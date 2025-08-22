@@ -1,70 +1,56 @@
 #!/usr/bin/env python3
-"""
-Skrypt do znajdowania wspólnych wartości w plikach values.yaml z podkatalogów
-i przenoszenia ich do głównego pliku values.yaml.
-
-Użycie: python main.py <ścieżka_do_katalogu_nadrzędnego>
-"""
 
 import sys
-import yaml
+from ruamel.yaml import YAML
 from pathlib import Path
 from typing import Dict, Any, List, Set
 import argparse
 
+yaml = YAML()
+yaml.preserve_quotes = True
+yaml.map_indent = 2
+yaml.sequence_indent = 4
+
 
 def load_yaml_file(file_path: Path) -> Dict[str, Any]:
-    """Wczytuje plik YAML i zwraca jego zawartość."""
     try:
         with open(file_path, 'r', encoding='utf-8') as file:
-            return yaml.safe_load(file) or {}
+            return yaml.load(file) or {}
     except Exception as e:
         print(f"Błąd podczas wczytywania {file_path}: {e}")
         return {}
 
 
 def save_yaml_file(file_path: Path, data: Dict[str, Any]):
-    """Zapisuje dane do pliku YAML."""
     try:
         with open(file_path, 'w', encoding='utf-8') as file:
-            yaml.dump(data, file, default_flow_style=False, allow_unicode=True, sort_keys=True)
+            yaml.dump(data, file)
         print(f"Zapisano: {file_path}")
     except Exception as e:
         print(f"Błąd podczas zapisywania {file_path}: {e}")
 
 
-def find_subdirectory_yaml_files(parent_dir: Path) -> List[Path]:
-    """Znajduje wszystkie pliki values.yaml w podkatalogach (rekursywnie), pomijając pliki bezpośrednio w katalogach warstw."""
-    yaml_files = []
+def find_subdirectory_yaml_files_by_layer(parent_dir: Path) -> Dict[str, List[Path]]:
+    layers = {}
+    for layer_dir in parent_dir.iterdir():
+        if layer_dir.is_dir() and layer_dir.name.startswith('ttom'):
+            layer_name = layer_dir.name
+            yaml_files = []
 
-    def search_recursive(current_dir: Path, depth: int = 0):
-        """Rekursywnie przeszukuje katalogi w poszukiwaniu plików values.yaml."""
-        # Ograniczenie głębokości dla bezpieczeństwa (maksymalnie 3 poziomy w głąb)
-        if depth > 3:
-            return
-
-        for item in current_dir.iterdir():
-            if item.is_dir():
-                values_file = item / "values.yaml"
-                if values_file.exists():
-                    # Sprawdź czy to nie jest plik values.yaml bezpośrednio w katalogu warstwy (ttomsd, ttomhd)
-                    # Jeśli parent tego pliku to katalog warstwy (ttomXX), a grandparent to katalog główny
-                    parent_name = item.parent.name
-                    grandparent = item.parent.parent
-
-                    # Jeśli to jest podkatalog serwisu (nie bezpośrednio w warstwie), dodaj plik
-                    if not (parent_name.startswith('ttom') and grandparent == parent_dir):
+            # Przeszukaj katalogi serwisów w danej warstwie
+            for service_dir in layer_dir.iterdir():
+                if service_dir.is_dir():
+                    values_file = service_dir / "values.yaml"
+                    if values_file.exists():
                         yaml_files.append(values_file)
-                else:
-                    # Jeśli w tym katalogu nie ma values.yaml, szukaj głębiej
-                    search_recursive(item, depth + 1)
 
-    search_recursive(parent_dir)
-    return yaml_files
+            if yaml_files:
+                layers[layer_name] = yaml_files
+
+    return layers
 
 
 def flatten_dict(d: Dict[str, Any], parent_key: str = '', sep: str = '___') -> Dict[str, Any]:
-    """Spłaszcza zagnieżdżony słownik do jednopoziomowego."""
     items = []
     for k, v in d.items():
         new_key = f"{parent_key}{sep}{k}" if parent_key else k
@@ -76,7 +62,6 @@ def flatten_dict(d: Dict[str, Any], parent_key: str = '', sep: str = '___') -> D
 
 
 def unflatten_dict(d: Dict[str, Any], sep: str = '___') -> Dict[str, Any]:
-    """Odtwarza zagnieżdżoną strukturę słownika z spłaszczonego."""
     result = {}
     for key, value in d.items():
         parts = key.split(sep)
@@ -85,18 +70,13 @@ def unflatten_dict(d: Dict[str, Any], sep: str = '___') -> Dict[str, Any]:
             if part not in current:
                 current[part] = {}
             elif not isinstance(current[part], dict):
-                # Jeśli napotykamy wartość skalarną w miejscu gdzie powinien być słownik,
-                # to znaczy że mamy konflikt ścieżek. W takim przypadku tworzymy nowy słownik.
                 current[part] = {}
             current = current[part]
 
-        # Sprawdź czy ostatni element już istnieje i czy nie ma konfliktu
         final_key = parts[-1]
         if final_key in current and isinstance(current[final_key], dict) and not isinstance(value, dict):
-            # Jeśli próbujemy nadpisać słownik wartością skalarną, pomiń
             continue
         elif final_key in current and not isinstance(current[final_key], dict) and isinstance(value, dict):
-            # Jeśli próbujemy nadpisać wartość skalarną słownikiem, nadpisz
             current[final_key] = value
         else:
             current[final_key] = value
@@ -104,10 +84,8 @@ def unflatten_dict(d: Dict[str, Any], sep: str = '___') -> Dict[str, Any]:
 
 
 def remove_keys_from_dict(d: Dict[str, Any], keys_to_remove: Set[str], sep: str = '___') -> Dict[str, Any]:
-    """Usuwa klucze ze słownika (obsługuje zagnieżdżone klucze)."""
     flat_dict = flatten_dict(d, sep=sep)
 
-    # Usuń klucze, które są w zestawie do usunięcia
     for key in list(flat_dict.keys()):
         if key in keys_to_remove:
             del flat_dict[key]
@@ -115,12 +93,31 @@ def remove_keys_from_dict(d: Dict[str, Any], keys_to_remove: Set[str], sep: str 
     return unflatten_dict(flat_dict, sep=sep)
 
 
+def remove_keys_from_yaml(data: Dict[str, Any], keys_to_remove: Set[str], sep: str = '___') -> Dict[str, Any]:
+    def remove_from_nested_dict(d: Dict[str, Any], prefix: str = '') -> Dict[str, Any]:
+        result = type(d)()
+
+        for key, value in d.items():
+            current_path = f"{prefix}{sep}{key}" if prefix else key
+
+            if current_path in keys_to_remove:
+                continue
+            if isinstance(value, dict):
+                nested_result = remove_from_nested_dict(value, current_path)
+                if nested_result:
+                    result[key] = nested_result
+            else:
+                result[key] = value
+
+        return result
+
+    return remove_from_nested_dict(data)
+
+
 def find_common_values(yaml_files: List[Path]) -> Dict[str, Any]:
-    """Znajduje wspólne wartości we wszystkich plikach YAML."""
     if not yaml_files:
         return {}
 
-    # Wczytaj wszystkie pliki
     all_data = []
     for yaml_file in yaml_files:
         data = load_yaml_file(yaml_file)
@@ -134,7 +131,6 @@ def find_common_values(yaml_files: List[Path]) -> Dict[str, Any]:
     if not all_data:
         return {}
 
-    # Znajdź wspólne klucze i wartości
     common_items = {}
     first_data = all_data[0]
 
@@ -144,7 +140,6 @@ def find_common_values(yaml_files: List[Path]) -> Dict[str, Any]:
         if i < 5:  # Pokaż pierwsze 5 kluczy
             print(f"  {key} = {value}")
 
-    # Sprawdź kilka przykładowych kluczy szczegółowo
     sample_keys = list(first_data.keys())[:3]
 
     for key in sample_keys:
@@ -166,7 +161,6 @@ def find_common_values(yaml_files: List[Path]) -> Dict[str, Any]:
         print(f"  Wszystkie zgodne: {all_match}")
 
     for key, value in first_data.items():
-        # Sprawdź czy ten klucz i wartość występuje we wszystkich plikach
         if all(key in data and data[key] == value for data in all_data[1:]):
             common_items[key] = value
 
@@ -181,7 +175,6 @@ def find_common_values(yaml_files: List[Path]) -> Dict[str, Any]:
 
 
 def merge_dicts(dict1: Dict[str, Any], dict2: Dict[str, Any]) -> Dict[str, Any]:
-    """Łączy dwa słowniki, zachowując strukturę zagnieżdżoną."""
     result = dict1.copy()
 
     for key, value in dict2.items():
@@ -206,70 +199,82 @@ def main():
 
     print(f"Sprawdzam katalog: {parent_dir}")
 
-    # Sprawdź czy katalog nadrzędny istnieje
     if not parent_dir.exists() or not parent_dir.is_dir():
         print(f"Błąd: Katalog {parent_dir} nie istnieje lub nie jest katalogiem!")
         sys.exit(1)
 
-    # Znajdź plik values.yaml w katalogu nadrzędnym
-    parent_yaml_path = parent_dir / "values.yaml"
+    print("Rozpoczynam szukanie plików values.yaml w warstwach...")
+    layers_yaml_files = find_subdirectory_yaml_files_by_layer(parent_dir)
 
-    print(f"Szukam głównego pliku: {parent_yaml_path}")
-
-    if not parent_yaml_path.exists():
-        print(f"Błąd: Plik values.yaml nie został znaleziony w katalogu {parent_dir}!")
-        sys.exit(1)
-
-    print(f"Znaleziono główny plik values.yaml: {parent_yaml_path}")
-
-    # Znajdź wszystkie pliki values.yaml w podkatalogach
-    print("Rozpoczynam szukanie plików values.yaml w podkatalogach...")
-    subdirectory_yaml_files = find_subdirectory_yaml_files(parent_dir)
-
-    print(f"Znaleziono {len(subdirectory_yaml_files)} plików w podkatalogach")
-
-    if not subdirectory_yaml_files:
-        print("Nie znaleziono plików values.yaml w podkatalogach.")
+    if not layers_yaml_files:
+        print("Nie znaleziono katalogów warstw (ttom*) z plikami values.yaml.")
         return
 
-    print(f"Znaleziono {len(subdirectory_yaml_files)} plików values.yaml w podkatalogach:")
-    for yaml_file in subdirectory_yaml_files:
-        print(f"  - {yaml_file}")
+    print(f"Znaleziono {len(layers_yaml_files)} warstw:")
+    for layer_name, yaml_files in layers_yaml_files.items():
+        print(f"  Warstwa {layer_name}: {len(yaml_files)} plików")
+        for yaml_file in yaml_files:
+            print(f"    - {yaml_file.name}")
 
-    # Znajdź wspólne wartości
-    print("\nSzukanie wspólnych wartości...")
-    common_values = find_common_values(subdirectory_yaml_files)
+    for layer_name, yaml_files in layers_yaml_files.items():
+        print(f"\n{'='*60}")
+        print(f"PRZETWARZAM WARSTWĘ: {layer_name}")
+        print(f"{'='*60}")
 
-    if not common_values:
-        print("Nie znaleziono wspólnych wartości.")
-        return
+        layer_dir = parent_dir / layer_name
+        layer_yaml_path = layer_dir / "values.yaml"
 
-    print(f"\nZnaleziono wspólne wartości:")
-    print(yaml.dump(common_values, default_flow_style=False, allow_unicode=True))
+        print(f"Katalog warstwy: {layer_dir}")
+        print(f"Plik values.yaml warstwy: {layer_yaml_path}")
+
+        if not layer_yaml_path.exists():
+            print(f"Ostrzeżenie: Plik {layer_yaml_path} nie istnieje - zostanie utworzony")
+            layer_data = {}
+        else:
+            layer_data = load_yaml_file(layer_yaml_path)
+            print(f"Wczytano istniejący plik warstwy z {len(flatten_dict(layer_data))} kluczami")
+
+        print(f"\nSzukanie wspólnych wartości dla warstwy {layer_name}...")
+        common_values = find_common_values(yaml_files)
+
+        if not common_values:
+            print(f"Nie znaleziono wspólnych wartości dla warstwy {layer_name}.")
+            continue
+
+        print(f"\nZnaleziono wspólne wartości dla warstwy {layer_name}:")
+        from io import StringIO
+        output = StringIO()
+        yaml.dump(common_values, output)
+        print(output.getvalue())
+
+        if args.dry_run:
+            print(f"TRYB TESTOWY - plik warstwy {layer_name} nie został zmieniony.")
+        else:
+            updated_layer_data = merge_dicts(layer_data, common_values)
+
+            save_yaml_file(layer_yaml_path, updated_layer_data)
+
+            common_keys = set(flatten_dict(common_values).keys())
+
+            print(f"\nUsuwam wspólne wartości z {len(yaml_files)} plików serwisów w warstwie {layer_name}...")
+            for yaml_file in yaml_files:
+                data = load_yaml_file(yaml_file)
+                updated_data = remove_keys_from_yaml(data, common_keys)
+                save_yaml_file(yaml_file, updated_data)
+
+            print(f"Pomyślnie przeniesiono wspólne wartości do {layer_yaml_path}")
 
     if args.dry_run:
+        print(f"\n{'='*60}")
         print("TRYB TESTOWY - żadne pliki nie zostały zmienione.")
-        return
-
-    # Wczytaj główny plik values.yaml
-    parent_data = load_yaml_file(parent_yaml_path)
-
-    # Dodaj wspólne wartości do głównego pliku
-    updated_parent_data = merge_dicts(parent_data, common_values)
-
-    # Zapisz zaktualizowany główny plik
-    save_yaml_file(parent_yaml_path, updated_parent_data)
-
-    # Usuń wspólne wartości z plików podrzędnych
-    common_keys = set(flatten_dict(common_values).keys())
-
-    for yaml_file in subdirectory_yaml_files:
-        data = load_yaml_file(yaml_file)
-        updated_data = remove_keys_from_dict(data, common_keys)
-        save_yaml_file(yaml_file, updated_data)
-
-    print(f"\nPomyślnie przeniesiono wspólne wartości do {parent_yaml_path}")
-    print(f"Zaktualizowano {len(subdirectory_yaml_files)} plików podrzędnych")
+        print(f"{'='*60}")
+    else:
+        print(f"\n{'='*60}")
+        print("ZAKOŃCZONO PRZETWARZANIE WSZYSTKICH WARSTW")
+        print(f"{'='*60}")
+        total_layers = len(layers_yaml_files)
+        total_files = sum(len(files) for files in layers_yaml_files.values())
+        print(f"Przetworzono {total_layers} warstw z łącznie {total_files} plikami serwisów")
 
 
 if __name__ == "__main__":
